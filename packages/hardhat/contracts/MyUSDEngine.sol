@@ -70,36 +70,147 @@ contract MyUSDEngine is Ownable {
     }
 
     // Checkpoint 2: Depositing Collateral & Understanding Value
-    function addCollateral() public payable {}
+    function addCollateral() public payable {
+        if(msg.value == 0) revert Engine__InvalidAmount();
+        s_userCollateral[msg.sender] += msg.value;
+        emit CollateralAdded(msg.sender, msg.value, i_oracle.getETHMyUSDPrice());
+    }
 
-    function calculateCollateralValue(address user) public view returns (uint256) {}
-
+    function calculateCollateralValue(address user) public view returns (uint256) {
+        return s_userCollateral[user] * i_oracle.getETHMyUSDPrice() / PRECISION;
+    }
     // Checkpoint 3: Interest Calculation System
-    function _getCurrentExchangeRate() internal view returns (uint256) {}
+    function _getCurrentExchangeRate() internal view returns (uint256) {
+        if(totalDebtShares == 0) {
+            return debtExchangeRate;
+        }
+        uint256 timeElapsed = block.timestamp - lastUpdateTime;
+          if (timeElapsed == 0 || borrowRate == 0) return debtExchangeRate;
+        uint256  interest = ( borrowRate * timeElapsed * PRECISION) / (SECONDS_PER_YEAR * 10000);
+        uint256 factor = PRECISION + interest;
+        return (debtExchangeRate * factor) /PRECISION;
+    }
 
-    function _accrueInterest() internal {}
+    function _accrueInterest() internal {
+        if (totalDebtShares == 0) {
+        lastUpdateTime =block.timestamp;
+        return;
+        }
+        debtExchangeRate =_getCurrentExchangeRate();
+        lastUpdateTime = block.timestamp;
+    }
 
-    function _getMyUSDToShares(uint256 amount) internal view returns (uint256) {}
+    function _getMyUSDToShares(uint256 amount) internal view returns (uint256) {
+        uint256 currentExchangeRate =_getCurrentExchangeRate();
+        return  (amount *PRECISION) /currentExchangeRate;
+    }
 
     // Checkpoint 4: Minting MyUSD & Position Health
-    function getCurrentDebtValue(address user) public view returns (uint256) {}
-
-    function calculatePositionRatio(address user) public view returns (uint256) {}
-
-    function _validatePosition(address user) internal view {}
-
-    function mintMyUSD(uint256 mintAmount) public {}
+    function getCurrentDebtValue(address user) public view returns (uint256) {
+        if(s_userDebtShares[user] == 0){
+            return 0;
+        }
+        uint256 currentExchangeRate = _getCurrentExchangeRate();
+        return (s_userDebtShares[user] * currentExchangeRate) / PRECISION;
+    }
+    function calculatePositionRatio(address user) public view returns (uint256) {
+        uint256 debtValue = getCurrentDebtValue(user);
+        if(debtValue == 0) {
+            return type(uint256).max;
+        }
+        uint256 collateralValue = calculateCollateralValue(user);
+        return (collateralValue * PRECISION) / debtValue; 
+    }
+    function _validatePosition(address user) internal view {
+         uint256 positionRatio = calculatePositionRatio(user);
+        if ((positionRatio * 100) < COLLATERAL_RATIO * PRECISION) {
+            revert Engine__UnsafePositionRatio();
+        }
+    }
+    function mintMyUSD(uint256 mintAmount) public {
+            if(mintAmount == 0) revert Engine__InvalidAmount();
+            uint256 sharesToMint = _getMyUSDToShares(mintAmount);
+            s_userDebtShares[msg.sender] += sharesToMint;
+            totalDebtShares += sharesToMint;
+            _validatePosition(msg.sender);
+            i_myUSD.mintTo(msg.sender, mintAmount);
+            emit DebtSharesMinted(msg.sender, mintAmount, sharesToMint);
+    }
 
     // Checkpoint 5: Accruing Interest & Managing Borrow Rates
-    function setBorrowRate(uint256 newRate) external onlyRateController {}
+    function setBorrowRate(uint256 newRate) external onlyRateController {
+        _accrueInterest();
+        if( newRate < i_staking.savingsRate()) revert Engine__InvalidBorrowRate();
+        borrowRate = newRate;
+        emit BorrowRateUpdated(newRate);
+    }
 
     // Checkpoint 6: Repaying Debt & Withdrawing Collateral
-    function repayUpTo(uint256 amount) public {}
+    function repayUpTo(uint256 amount) public {
+        if(amount == 0) revert Engine__InvalidAmount();
+        uint256 amountInShares = _getMyUSDToShares(amount);
+        
+        if(amountInShares > s_userDebtShares[msg.sender]){
+            amountInShares = s_userDebtShares[msg.sender];
+            amount = getCurrentDebtValue(msg.sender);
+        }
 
-    function withdrawCollateral(uint256 amount) external {}
+        if(i_myUSD.balanceOf(msg.sender) < amount) revert MyUSD__InsufficientBalance();
+        if(i_myUSD.allowance(msg.sender, address(this)) < amount) revert MyUSD__InsufficientAllowance();
+        
+        s_userDebtShares[msg.sender] -= amountInShares;
+        totalDebtShares -= amountInShares;
+        i_myUSD.burnFrom(msg.sender, amount);
+
+        emit DebtSharesBurned(msg.sender, amount, amountInShares);
+    }
+
+    function withdrawCollateral(uint256 amount) external {
+        if(amount == 0) revert Engine__InvalidAmount();
+        if(s_userCollateral[msg.sender] < amount) revert Engine__InsufficientCollateral();
+
+        s_userCollateral[msg.sender] -= amount;
+        if (s_userDebtShares[msg.sender] > 0) {
+            _validatePosition(msg.sender);
+        }
+
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        if(!success) revert Engine__TransferFailed();
+
+        emit CollateralWithdrawn(msg.sender, amount, i_oracle.getETHMyUSDPrice());
+    }
 
     // Checkpoint 7: Liquidation - Enforcing System Stability
-    function isLiquidatable(address user) public view returns (bool) {}
+    function isLiquidatable(address user) public view returns (bool) {
+        uint256 positionRatio = calculatePositionRatio(user);
+        return (positionRatio * 100) < COLLATERAL_RATIO * PRECISION;
+    }
+    function liquidate(address user) external {
+        _accrueInterest();
 
-    function liquidate(address user) external {}
+        if(!isLiquidatable(user)) revert Engine__NotLiquidatable();
+         uint256 userDebtValue = getCurrentDebtValue(user);
+         uint256 userCollateral = s_userCollateral[user];
+        uint256 collateralValue = calculateCollateralValue(user);
+
+        if(i_myUSD.balanceOf(msg.sender) < userDebtValue) revert MyUSD__InsufficientBalance();
+        if(i_myUSD.allowance(msg.sender, address(this)) < userDebtValue) revert MyUSD__InsufficientAllowance();
+
+        i_myUSD.burnFrom(msg.sender, userDebtValue);
+        totalDebtShares -= s_userDebtShares[user];
+        s_userDebtShares[user] = 0;
+
+        uint256 collateralToCoverDebt = (userDebtValue * userCollateral) / collateralValue;
+        uint256 reward = (collateralToCoverDebt * LIQUIDATOR_REWARD) / 100;
+        uint256 totalCollateralToTransfer = collateralToCoverDebt + reward;
+
+        if(totalCollateralToTransfer > userCollateral) {
+            totalCollateralToTransfer = userCollateral;
+        }
+        s_userCollateral[user] -= totalCollateralToTransfer;
+        (bool success, ) = payable(msg.sender).call{value: totalCollateralToTransfer}("");
+        if(!success) revert Engine__TransferFailed();
+        
+        emit Liquidation(user, msg.sender, totalCollateralToTransfer, userDebtValue, i_oracle.getETHMyUSDPrice());
+    }
 }
